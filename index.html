@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<title>llm-scope — the maya conversation, live</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+ body{margin:0;background:#0b0f14;color:#cdd6e0;font:13px/1.45 system-ui,Segoe UI,Roboto,sans-serif}
+ header{padding:10px 16px;border-bottom:1px solid #1d2630;display:flex;gap:18px;align-items:baseline;flex-wrap:wrap}
+ h1{font-size:16px;margin:0;color:#e6edf3}
+ #state{color:#8fa3b8}
+ .rg{margin-left:auto}
+ .rg button{background:#16202b;color:#9fb2c6;border:1px solid #2a3947;border-radius:4px;padding:3px 10px;cursor:pointer;margin-left:4px}
+ .rg button.on{background:#24425e;color:#dce9f7;border-color:#3f6d99}
+ .lane{margin:6px 12px 14px}
+ .lane h3{margin:2px 0 4px;font-size:12px;color:#7f95ab;font-weight:600;letter-spacing:.4px}
+ svg{display:block;background:#0e141b;border:1px solid #1d2630;border-radius:6px}
+ #strip{margin:6px 12px 20px}
+ .cap{stroke:#e0556a;stroke-dasharray:6 4}
+ .ref{fill:#ff6b7a}
+ .warn{fill:#e0b455}
+ .life{fill:#63a8e8}
+ text{fill:#5f7488;font-size:10px}
+ .tip{font-size:11px;color:#a9bdd2;margin:2px 0 6px}
+</style></head><body>
+<header><h1>llm-scope</h1><span id="state">loading…</span>
+ <span class="rg" id="rg">
+  <button data-s="900">15m</button><button data-s="3600" class="on">1h</button>
+  <button data-s="21600">6h</button><button data-s="0">all</button>
+ </span></header>
+<div class="tip">lanes, top→bottom: prompt size per request (cap = red dashed at 65,536 · refusals = red × · a sudden drop = a compaction) ·
+prefill tok/s (bar height = how fast the prompt was read; the NVMe lane shows the GB underneath) ·
+decode tok/s (live line = every second of thinking/answering; blue dots = per-request average) · MTP/draft acceptance % · system: GPU %, PSI-io full %, NVMe read MB/s, Dirty MiB ·
+bottom strip: engine life (blue) · warnings (amber) · refusals (red). Hover anything for details.</div>
+<div class="lane"><h3>PROMPT TOKENS / CONTEXT</h3><svg id="l1"></svg></div>
+<div class="lane"><h3>PREFILL tok/s (bar = reading speed · tooltip = ms, chunks)</h3><svg id="l2"></svg></div>
+<div class="lane"><h3>DECODE tok/s (live per-second line · blue dots = per-request)</h3><svg id="l3"></svg></div>
+<div class="lane"><h3>MTP / DRAFT ACCEPTANCE %</h3><svg id="lmtp"></svg></div>
+<div class="lane"><h3>GPU %</h3><svg id="l4"></svg></div>
+<div class="lane"><h3>PSI-IO full %</h3><svg id="l5"></svg></div>
+<div class="lane"><h3>NVMe read MB/s</h3><svg id="l6"></svg></div>
+<div class="lane"><h3>Dirty MiB (write bursts)</h3><svg id="l7"></svg></div>
+<div id="strip"><h3 style="margin:2px 0 4px;font-size:12px;color:#7f95ab">EVENTS</h3><svg id="l8"></svg></div>
+<script>
+const EV = {};              // type -> [{ts,...}]
+let since = 0, range = 3600, tmin = 0, tmax = 1;
+const $ = id => document.getElementById(id);
+const fmt = n => n==null ? "–" : Number(n).toLocaleString("en-US");
+for (const b of document.querySelectorAll("#rg button")) b.onclick = () => {
+  range = +b.dataset.s;
+  for (const x of document.querySelectorAll("#rg button")) x.classList.toggle("on", x===b);
+  render();
+};
+async function poll(){
+  try{
+    const r = await fetch("/api/events?since="+since);
+    const j = await r.json();
+    for (const e of j.events){ (EV[e.type] ||= []).push(e); since = Math.max(since, e.ts); }
+    const s = await (await fetch("/api/state")).json();
+    $("state").textContent =
+      `requests ${s.requests} · completed ${s.completed} · refusals ${s.refusals} · last prompt ${fmt(s.last_prompt)} tok · io full ${s.io_full==null?"–":s.io_full+"%"} · ${new Date(j.now*1000).toLocaleTimeString()}`;
+  }catch(e){ $("state").textContent = "poll failed: "+e; }
+  render();
+}
+function view(t, f){  // events of a type within range, mapped (missing type = empty)
+  const list = EV[t] || [];
+  const cut = range ? tmax - range : 0;
+  return list.filter(e => e.ts >= cut && e.ts <= tmax).map(f).filter(Boolean);
+}
+function lane(id, series, marks, ylab, ymaxOverride, Hh){
+  const svg = $(id), W = Math.max(innerWidth-28, 600), H = Hh || 110, padL = 46, padR = 8, padT = 6, padB = 16;
+  svg.setAttribute("width", W); svg.setAttribute("height", H); svg.innerHTML = "";
+  const yMax = ymaxOverride || Math.max(1, ...series.flatMap(s => view(s.t, s.y).map(p => p.y))) * 1.15;
+  const X = t => tmin >= tmax ? padL : padL + (t - tmin)/(tmax - tmin)*(W-padL-padR);
+  const Y = v => H - padB - Math.max(0, Math.min(1, v/yMax))*(H-padT-padB);
+  let g = `<line x1="${padL}" y1="${H-padB}" x2="${W-padR}" y2="${H-padB}" stroke="#22303d"/>`;
+  for (const s of series){
+    const pts = view(s.t, e => ({t:e.ts, y:s.y(e), tip:s.tip(e)}));
+    if (s.line && pts.length > 1)
+      g += `<polyline fill="none" stroke="${s.c}" stroke-width="1.4" opacity="${s.o||0.9}" points="${pts.map(p=>X(p.t)+","+Y(p.y)).join(" ")}"/>`;
+    for (const p of pts){
+      const r = s.r||2.4;
+      g += s.bar
+        ? `<rect x="${X(p.t)-2.5}" y="${Y(p.y)}" width="5" height="${H-padB-Y(p.y)}" fill="${s.c}" opacity="${s.o||0.9}"><title>${p.tip}</title></rect>`
+        : `<circle cx="${X(p.t)}" cy="${Y(p.y)}" r="${r}" fill="${s.c}" opacity="${s.o||0.95}"><title>${p.tip}</title></circle>`;
+    }
+  }
+  const cut = range ? tmax - range : 0;
+  for (const m of (marks||[])){
+    const src = m.t ? (EV[m.t]||[]) : (m.list||[]);
+    const pts = src.filter(e => e.ts >= cut && e.ts <= tmax).map(e => ({t:e.ts, e}));
+    for (const p of pts){
+      const tip = m.tip ? m.tip(p.e) : "";
+      if (m.dot){
+        const cy = Y(m.y != null ? m.y : 50);
+        g += `<circle cx="${X(p.t)}" cy="${cy}" r="${m.dot}" fill="${m.c}"><title>${tip}</title></circle>`;
+        if (m.label){
+          const lab = typeof m.label === "function" ? m.label(p.e) : m.label;
+          g += `<text x="${X(p.t)+m.dot+4}" y="${cy-m.dot-5}" fill="${m.c}" style="font-size:11px">${lab}</text>`;
+        }
+      } else {
+        g += `<line x1="${X(p.t)}" y1="${padT}" x2="${X(p.t)}" y2="${H-padB}" stroke="${m.c}" stroke-width="${m.w||1}" ${m.d?`stroke-dasharray="${m.d}"`:""}><title>${tip}</title></line>`;
+      }
+    }
+  }
+  for (const f of [1, 0.5]){
+    const v = yMax*f;
+    g += `<line x1="${padL}" y1="${Y(v)}" x2="${W-padR}" y2="${Y(v)}" stroke="#1c2733" stroke-dasharray="2 4"/>`;
+    g += `<text x="2" y="${Y(v)-3}">${fmt(Math.round(v))}${ylab ? " " + ylab : ""}</text>`;
+  }
+  g += `<text x="2" y="${H-padB-2}">0${ylab ? " " + ylab : ""}</text>`;
+  g += `<text x="${W-74}" y="${H-4}">${new Date(tmin*1000).toLocaleTimeString()}</text>`;
+  svg.innerHTML = g + "";
+}
+function render(){
+  const all = Object.values(EV).flat();
+  if (!all.length){ return; }
+  const cut = range ? Date.now()/1000 - range : 0;
+  const vis = all.filter(e => e.ts >= cut);
+  tmin = Math.min(...vis.map(e=>e.ts)); tmax = Math.max(...vis.map(e=>e.ts), Date.now()/1000);
+  if (tmax - tmin < 60) tmin = tmax - 60;
+  const R = EV.refused||[];
+  lane("l1",
+    [{t:"req", y:e=>e.prompt_tokens, c:"#7fd1a8", tip:e=>`request: prompt ${fmt(e.prompt_tokens)} tok · msgs ${e.msgs} · tools ${e.tools} · last ${e.last_role}: ${e.last_preview}`}],
+    [{t:"refused", c:"#e0556a", tip:e=>`REFUSED ${fmt(e.tokens)} tok > cap ${fmt(e.cap)} · ${e.last_role}: ${e.last_preview}`}],
+    "tok", 65536);
+  lane("l2",
+    [{t:"prefill_sum", y:e=>e.tok_s, c:"#e8b25e", bar:1, tip:e=>`prefill: ${fmt(e.tokens)} tok in ${(e.ms/1000).toFixed(1)} s → ${e.tok_s.toFixed(0)} tok/s · ${e.chunks} chunk(s) of ${fmt(e.chunk_tokens)}`}],
+    null, "tok/s");
+  lane("l3",
+    [{t:"phase", y:e=>e.tok_s, c:"#7fb3ff", line:1, tip:e=>`${e.phase}: ${fmt(e.tokens)} tok at ${e.tok_s} tok/s (t+${fmt(e.elapsed)} s)`},
+     {t:"done", y:e=>e.tok_s, c:"#cfe3ff", r:3, tip:e=>`done: ${fmt(e.tokens)} tok in ${fmt(e.seconds)} s → ${e.tok_s} tok/s avg · ${e.finish}${e.cancel?" (cancelled)":""}${e.cache_pct!=null?" · expert cache "+e.cache_pct+"%":""}`}],
+    null, "tok/s");
+  lane("lmtp",
+    [{t:"spec", y:e=>e.pct, c:"#66d9c4", line:1, tip:e=>`MTP drafts: ${e.accepted}/${e.drafts} accepted (${e.pct}%)`}],
+    null, "%", 100);
+  lane("l4", [{t:"gpu", y:e=>e.u, c:"#59c98b", line:1, tip:e=>`GPU ${e.u}% · ${e.t}°C · ${e.p}W · held ${fmt(e.m)} MiB · free ${e.f} GiB`}], null, "%", 100);
+  lane("l5", [{t:"sys", y:e=>e.io_full, c:"#e08a5a", line:1, tip:e=>`PSI-io full ${e.io_full}% (some ${e.io_some}%) · NVMe r ${e.disk_r_mbs} MB/s`}], null, "%", 100);
+  lane("l6", [{t:"sys", y:e=>e.disk_r_mbs, c:"#b98ae0", line:1, tip:e=>`NVMe read ${e.disk_r_mbs} MB/s · write ${e.disk_w_mbs} MB/s · in-flight ${e.in_flight}`}], null, "MB/s");
+  lane("l7", [{t:"sys", y:e=>e.dirty_mib, c:"#d1d86e", line:1, tip:e=>`Dirty ${e.dirty_mib} MiB · writeback ${e.writeback_mib} MiB`}], null, "MiB");
+  const fmtK = n => (n/1000).toFixed(1)+"K";
+  const rq = (EV.req||[]).slice().sort((a,b)=>a.ts-b.ts), comp = [];
+  for (let i=1;i<rq.length;i++){
+    const a=rq[i-1].prompt_tokens, b=rq[i].prompt_tokens;
+    if (b < 0.85*a) comp.push({ts:rq[i].ts, from:a, to:b});
+  }
+  lane("l8",
+    [{t:"slot_save", y:()=>8, c:"#66d9c4", r:2.2, tip:e=>`slot saved: ${fmt(e.tokens)} tok (${e.gb} GB in ${e.s} s)`},
+     {t:"ckpt", y:()=>8, c:"#a8e8d9", r:2.2, tip:e=>`checkpoint reuse: ${fmt(e.reused)} of ${fmt(e.prompt_tokens)} tok (${(100*e.reused/e.prompt_tokens).toFixed(1)}%)`},
+     {t:"tool_result", y:()=>8, c:"#9aa8b8", r:1.8, tip:e=>`tool ${e.name}: ${fmt(e.chars)} chars in ${e.s} s${e.truncated?" (truncated)":""}`}],
+    [{list:comp, dot:8, y:26, c:"#66d9c4",
+      label:e=>`compacted: ${fmtK(e.from)} → ${fmtK(e.to)} tok`,
+      tip:e=>`the session was summarized: ${fmt(e.from)} → ${fmt(e.to)} tok (the drop on the PROMPT lane)`},
+     {t:"refused", dot:9, y:52, c:"#ff6b7a",
+      label:e=>`REFUSED ${fmt(e.tokens)} tok — over the ${fmt(e.cap)} cap`,
+      tip:e=>`the server refused this prompt before the engine read it · msgs ${e.msgs} · tools ${e.tools} · last ${e.last_role}: ${e.last_preview}`},
+     {t:"warning", dot:7, y:80, c:"#e0b455",
+      label:e=>`queue: ${e.waiters} request(s) waited up to ${fmt(e.waited_s)} s`,
+      tip:e=>`requests queued behind a long generation`}],
+    "", 100, 150);
+}
+poll(); setInterval(poll, 3000);
+</script></body></html>
